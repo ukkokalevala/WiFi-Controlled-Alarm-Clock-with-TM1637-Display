@@ -45,3 +45,26 @@ Snooze implemented with millis() target so it survives independently of the NTP 
 
 Why I Built It
 Most commercial alarm clocks either lock you into an app, require a cloud account, or are just ugly. This one is a small weekend project that turns ~$5 of parts into a genuinely useful desk companion — a clock that always knows the right time and that you can reprogram from your phone in ten seconds.
+
+Hardware Setup
+Component	WeMos D1 Mini Pin
+TM1637 CLK	D2 (GPIO4)
+TM1637 DIO	D1 (GPIO5)
+TM1637 VCC	3.3V
+TM1637 GND	GND
+Buzzer (+)	D5 (GPIO14)
+Buzzer (-)	GND
+Button (one leg)	D6 (GPIO12)
+Button (other leg)	GND
+The button uses the internal pull-up, so no external resistor is needed.
+
+Required Libraries
+Install these from the Arduino IDE Library Manager:
+
+TM1637 by Avishay Orpaz
+
+NTPClient by Fabrice Weinberg
+
+ESP8266WebServer (built into ESP8266 board package)
+
+ESP8266WiFi (built in)
