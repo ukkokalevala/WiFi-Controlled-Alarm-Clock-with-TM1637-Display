@@ -1,0 +1,281 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <WiFiUdp.h>
+#include <NTPClient.h>
+#include <TM1637Display.h>
+#include <TimeLib.h>
+
+// ---------- CONFIG ----------
+const char* WIFI_SSID     = "YOUR_SSID";
+const char* WIFI_PASSWORD = "YOUR_PASSWORD";
+
+// Set your timezone offset in seconds
+// Examples: UTC+0 = 0, UTC+1 = 3600, UTC+2 = 7200, UTC-5 = -18000
+// South Africa (SAST) = UTC+2 = 7200
+const long  UTC_OFFSET_SECONDS = 7200;
+const char* NTP_SERVER         = "pool.ntp.org";
+
+// ---------- PINS ----------
+#define TM_CLK_PIN   D2   // GPIO4
+#define TM_DIO_PIN   D1   // GPIO5
+#define BUZZER_PIN   D5   // GPIO14
+#define BUTTON_PIN   D6   // GPIO12
+
+// ---------- OBJECTS ----------
+TM1637Display display(TM_CLK_PIN, TM_DIO_PIN);
+ESP8266WebServer server(80);
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, NTP_SERVER, UTC_OFFSET_SECONDS, 60000); // update every 60s
+
+// ---------- STATE ----------
+bool     alarmEnabled = false;
+int      alarmHour    = 7;
+int      alarmMinute  = 0;
+bool     alarmRinging = false;
+bool     snoozeActive = false;
+int      snoozeMinutes = 5;
+unsigned long snoozeUntil = 0;
+
+unsigned long lastDisplayUpdate = 0;
+unsigned long lastButtonPress   = 0;
+bool          lastButtonState   = HIGH;
+
+// ---------- SETUP ----------
+void setup() {
+  Serial.begin(9600);
+  delay(200);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  display.setBrightness(5);
+  display.clear();
+
+  // Show "boot" style placeholder
+  display.showNumberDec(0, false);
+
+  // Connect WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.print("Connected! IP: ");
+  Serial.println(WiFi.localIP());
+
+  // NTP
+  timeClient.begin();
+
+  // Web routes
+  server.on("/",       handleRoot);
+  server.on("/set",    handleSetAlarm);
+  server.on("/stop",   handleStopAlarm);
+  server.on("/snooze", handleSnooze);
+  server.on("/status", handleStatus);
+  server.begin();
+  Serial.println("Web server started");
+}
+
+// ---------- LOOP ----------
+void loop() {
+  server.handleClient();
+  timeClient.update();
+
+  handleButton();
+
+  // Check if it's time to ring
+  checkAlarm();
+
+  // Update display every 500ms
+  if (millis() - lastDisplayUpdate > 500) {
+    lastDisplayUpdate = millis();
+    updateDisplay();
+  }
+
+  // Buzzer pattern while ringing
+  if (alarmRinging) {
+    tone(BUZZER_PIN, 2000, 200);
+  }
+}
+
+// ---------- DISPLAY ----------
+void updateDisplay() {
+  if (alarmRinging) {
+    // Flash "AL" style — we just blink the current time
+    static bool blink = false;
+    blink = !blink;
+    if (blink) {
+      int h = timeClient.getHours();
+      int m = timeClient.getMinutes();
+      display.showNumberDecEx(h * 100 + m, 0b01000000, true);
+    } else {
+      display.clear();
+    }
+    return;
+  }
+
+  int h = timeClient.getHours();
+  int m = timeClient.getMinutes();
+  // 0b01000000 lights the middle colon
+  display.showNumberDecEx(h * 100 + m, 0b01000000, true);
+}
+
+// ---------- ALARM LOGIC ----------
+void checkAlarm() {
+  if (!alarmEnabled) return;
+  if (alarmRinging) return;
+
+  // Snooze check
+  if (snoozeActive) {
+    if (millis() >= snoozeUntil) {
+      snoozeActive = false;
+      alarmRinging = true;
+    }
+    return;
+  }
+
+  int h = timeClient.getHours();
+  int m = timeClient.getMinutes();
+  int s = timeClient.getSeconds();
+
+  if (h == alarmHour && m == alarmMinute && s < 2) {
+    alarmRinging = true;
+    Serial.println("ALARM!");
+  }
+}
+
+void stopAlarm() {
+  alarmRinging = false;
+  snoozeActive = false;
+  noTone(BUZZER_PIN);
+  digitalWrite(BUZZER_PIN, LOW);
+  Serial.println("Alarm stopped");
+}
+
+void snoozeAlarm() {
+  alarmRinging = false;
+  noTone(BUZZER_PIN);
+  digitalWrite(BUZZER_PIN, LOW);
+  snoozeActive = true;
+  snoozeUntil = millis() + (unsigned long)snoozeMinutes * 60000UL;
+  Serial.print("Snoozed for ");
+  Serial.print(snoozeMinutes);
+  Serial.println(" minutes");
+}
+
+// ---------- BUTTON ----------
+void handleButton() {
+  bool state = digitalRead(BUTTON_PIN);
+  if (state == LOW && lastButtonState == HIGH && (millis() - lastButtonPress > 300)) {
+    lastButtonPress = millis();
+    if (alarmRinging) {
+      stopAlarm();
+    } else if (snoozeActive) {
+      stopAlarm();
+    }
+  }
+  lastButtonState = state;
+}
+
+// ---------- WEB HANDLERS ----------
+void handleRoot() {
+  String html = R"HTML(
+<!DOCTYPE html><html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WiFi Alarm Clock</title>
+<style>
+  body { font-family: system-ui, sans-serif; background:#111; color:#eee;
+         display:flex; justify-content:center; padding:20px; }
+  .card { background:#1e1e1e; padding:24px; border-radius:16px;
+          box-shadow:0 4px 20px rgba(0,0,0,.5); width:340px; }
+  h1 { font-size:1.3rem; margin-top:0; text-align:center; }
+  label { display:block; margin:12px 0 4px; font-size:.9rem; color:#aaa; }
+  input[type=time], input[type=number] {
+    width:100%; padding:10px; font-size:1.1rem; border-radius:8px;
+    border:1px solid #333; background:#0d0d0d; color:#eee; box-sizing:border-box; }
+  button { width:100%; padding:12px; margin-top:14px; font-size:1rem;
+           border-radius:8px; border:none; cursor:pointer; font-weight:600; }
+  .primary { background:#3b82f6; color:#fff; }
+  .danger  { background:#ef4444; color:#fff; }
+  .warn    { background:#f59e0b; color:#000; }
+  .row { display:flex; gap:8px; }
+  .row button { flex:1; }
+  .status { text-align:center; margin-top:16px; font-size:.9rem; color:#888; }
+</style></head><body>
+<div class="card">
+  <h1>⏰ WiFi Alarm</h1>
+  <form action="/set" method="GET">
+    <label>Alarm Time</label>
+    <input type="time" name="time" id="time" required>
+    <label>Snooze (minutes)</label>
+    <input type="number" name="snooze" value="5" min="1" max="30">
+    <button class="primary" type="submit">Set Alarm</button>
+  </form>
+  <div class="row">
+    <button class="warn"   onclick="fetch('/snooze')">Snooze</button>
+    <button class="danger" onclick="fetch('/stop')">Stop</button>
+  </div>
+  <div class="status" id="status">Loading...</div>
+</div>
+<script>
+  async function refresh(){
+    try{
+      const r = await fetch('/status');
+      const j = await r.json();
+      document.getElementById('status').textContent =
+        `Alarm: ${j.enabled ? j.time : 'OFF'} | ${j.ringing ? '🔔 RINGING' : (j.snoozed ? '😴 Snoozed' : 'Idle')}`;
+      if(j.enabled) document.getElementById('time').value = j.time;
+    }catch(e){}
+  }
+  refresh(); setInterval(refresh, 3000);
+</script>
+</body></html>
+)HTML";
+  server.send(200, "text/html", html);
+}
+
+void handleSetAlarm() {
+  if (server.hasArg("time")) {
+    String t = server.arg("time");  // "HH:MM"
+    int colon = t.indexOf(':');
+    if (colon > 0) {
+      alarmHour   = t.substring(0, colon).toInt();
+      alarmMinute = t.substring(colon + 1).toInt();
+      alarmEnabled = true;
+      stopAlarm();
+      Serial.printf("Alarm set to %02d:%02d\n", alarmHour, alarmMinute);
+    }
+  }
+  if (server.hasArg("snooze")) {
+    int s = server.arg("snooze").toInt();
+    if (s >= 1 && s <= 30) snoozeMinutes = s;
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleStopAlarm() {
+  stopAlarm();
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleSnooze() {
+  if (alarmRinging) snoozeAlarm();
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleStatus() {
+  char buf[160];
+  snprintf(buf, sizeof(buf),
+    "{\"enabled\":%s,\"time\":\"%02d:%02d\",\"ringing\":%s,\"snoozed\":%s}",
+    alarmEnabled ? "true" : "false",
+    alarmHour, alarmMinute,
+    alarmRinging ? "true" : "false",
+    snoozeActive ? "true" : "false");
+  server.send(200, "application/json", buf);
+}
