@@ -1,0 +1,483 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <WiFiUdp.h>
+#include <NTPClient.h>
+#include <TM1637Display.h>
+#include <TimeLib.h>
+
+// ---------- CONFIG ----------
+const char* WIFI_SSID     = "YOUR_SSID";
+const char* WIFI_PASSWORD = "YOUR_PASSWORD";
+
+// Timezone offset in seconds. UTC+2 (South Africa) = 7200
+const long  UTC_OFFSET_SECONDS = 7200;
+const char* NTP_SERVER         = "pool.ntp.org";
+
+// ---------- PINS ----------
+#define TM_CLK_PIN   D2
+#define TM_DIO_PIN   D1
+#define BUZZER_PIN   D5
+#define BUTTON_PIN   D6
+
+// ---------- OBJECTS ----------
+TM1637Display display(TM_CLK_PIN, TM_DIO_PIN);
+ESP8266WebServer server(80);
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, NTP_SERVER, UTC_OFFSET_SECONDS, 60000);
+
+// ---------- STATE ----------
+bool     alarmEnabled  = false;
+int      alarmHour     = 7;
+int      alarmMinute   = 0;
+bool     alarmRinging  = false;
+bool     snoozeActive  = false;
+int      snoozeMinutes = 5;
+unsigned long snoozeUntil = 0;
+
+unsigned long lastDisplayUpdate = 0;
+unsigned long lastButtonPress   = 0;
+bool          lastButtonState   = HIGH;
+int           lastMinuteTick    = -1;
+
+// Melody selection (0..2)
+int  selectedMelody    = 0;
+bool minuteBeepEnabled = false;
+
+// Display view state
+bool          showDate       = false;   // false = time, true = date
+bool          autoToggleView = true;    // auto-cycle time <-> date
+unsigned long lastViewToggle = 0;
+const unsigned long VIEW_TOGGLE_INTERVAL = 5000; // ms per view
+
+// Colon blink timing
+unsigned long COLON_BLINK_INTERVAL = 500; // ms — half on, half off
+
+// ---------- 7-SEGMENT ENCODING ----------
+// Bit 0 = A (top), bit 1 = B (upper-right), bit 2 = C (lower-right),
+// bit 3 = D (bottom), bit 4 = E (lower-left), bit 5 = F (upper-left),
+// bit 6 = G (middle), bit 7 = DP (decimal point)
+const uint8_t SEG_DIGITS[10] = {
+  0b00111111, // 0
+  0b00000110, // 1
+  0b01011011, // 2
+  0b01001111, // 3
+  0b01100110, // 4
+  0b01101101, // 5
+  0b01111101, // 6
+  0b00000111, // 7
+  0b01111111, // 8
+  0b01101111  // 9
+};
+
+// ---------- MELODIES ----------
+struct Note { uint16_t freq; uint16_t dur; };
+
+const Note MELODY_CHIME[] = {
+  { 523, 200 }, { 659, 200 }, { 784, 200 }, { 1047, 400 },
+  { 784, 200 }, { 659, 200 }, { 523, 400 }, { 0, 700 }
+};
+
+const Note MELODY_BELL[] = {
+  { 880, 300 }, { 660, 300 }, { 0, 200 },
+  { 880, 300 }, { 660, 300 }, { 0, 800 }
+};
+
+const Note MELODY_RISE[] = {
+  { 392, 150 }, { 523, 150 }, { 659, 150 }, { 784, 250 }, { 0, 150 },
+  { 659, 150 }, { 784, 150 }, { 1047, 400 }, { 0, 800 }
+};
+
+const Note* MELODIES[]     = { MELODY_CHIME, MELODY_BELL, MELODY_RISE };
+const int   MELODY_LENGTHS[] = {
+  sizeof(MELODY_CHIME) / sizeof(Note),
+  sizeof(MELODY_BELL)  / sizeof(Note),
+  sizeof(MELODY_RISE)  / sizeof(Note)
+};
+const char* MELODY_NAMES[] = { "Morning Chime", "Soft Bell", "Upbeat Rise" };
+const int   MELODY_COUNT   = 3;
+
+int           melodyIndex     = 0;
+unsigned long melodyNoteStart = 0;
+bool          melodyActive    = false;
+
+// ---------- FORWARD DECLARATIONS ----------
+void handleRoot();
+void handleSetAlarm();
+void handleStopAlarm();
+void handleSnooze();
+void handleStatus();
+void handleSetMelody();
+void handleTestMelody();
+void handleToggleView();
+
+// ---------- SETUP ----------
+void setup() {
+  Serial.begin(9600);
+  delay(200);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  display.setBrightness(5);
+  display.clear();
+  display.showNumberDec(0, false);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.print("Connected! IP: ");
+  Serial.println(WiFi.localIP());
+
+  timeClient.begin();
+  timeClient.update();
+  setTime(timeClient.getEpochTime());
+
+  server.on("/",        handleRoot);
+  server.on("/set",     handleSetAlarm);
+  server.on("/stop",    handleStopAlarm);
+  server.on("/snooze",  handleSnooze);
+  server.on("/status",  handleStatus);
+  server.on("/melody",  handleSetMelody);
+  server.on("/test",    handleTestMelody);
+  server.on("/view",    handleToggleView);
+  server.begin();
+  Serial.println("Web server started");
+}
+
+// ---------- LOOP ----------
+void loop() {
+  server.handleClient();
+  timeClient.update();
+  setTime(timeClient.getEpochTime());
+
+  handleButton();
+  checkAlarm();
+  updateMelody();
+  handleMinuteBeep();
+
+  if (autoToggleView && !alarmRinging && millis() - lastViewToggle > VIEW_TOGGLE_INTERVAL) {
+    lastViewToggle = millis();
+    showDate = !showDate;
+  }
+
+  // Refresh display faster so the colon blink looks smooth.
+  // Use half the blink interval as the refresh rate.
+  unsigned long refreshMs = COLON_BLINK_INTERVAL / 2;
+  if (millis() - lastDisplayUpdate > refreshMs) {
+    lastDisplayUpdate = millis();
+    updateDisplay();
+  }
+}
+
+// ---------- DISPLAY ----------
+void updateDisplay() {
+  // While ringing, blink the whole time display (colon always on)
+  if (alarmRinging) {
+    static bool blink = false;
+    blink = !blink;
+    if (blink) {
+      int h = timeClient.getHours();
+      int m = timeClient.getMinutes();
+      display.showNumberDecEx(h * 100 + m, 0b01000000, true);
+    } else {
+      display.clear();
+    }
+    return;
+  }
+
+  // Date view — dash separator, no colon
+  if (showDate) {
+    time_t t = now();
+    int d  = day(t);
+    int mo = month(t);
+
+    uint8_t segs[4];
+    segs[0] = SEG_DIGITS[(d / 10) % 10];
+    segs[1] = SEG_DIGITS[d % 10];
+    segs[2] = SEG_DIGITS[(mo / 10) % 10];
+    segs[3] = SEG_DIGITS[mo % 10];
+    segs[1] |= 0b01000000;   // dash
+
+    display.setSegments(segs);
+    return;
+  }
+
+  // Time view — blinking colon
+  int h = timeClient.getHours();
+  int m = timeClient.getMinutes();
+
+  bool colonOn = (millis() % (COLON_BLINK_INTERVAL * 2)) < COLON_BLINK_INTERVAL;
+  uint8_t colonMask = colonOn ? 0b01000000 : 0b00000000;
+
+  display.showNumberDecEx(h * 100 + m, colonMask, true);
+}
+
+// ---------- ALARM LOGIC ----------
+void checkAlarm() {
+  if (!alarmEnabled || alarmRinging) return;
+
+  if (snoozeActive) {
+    if (millis() >= snoozeUntil) {
+      snoozeActive = false;
+      alarmRinging = true;
+    }
+    return;
+  }
+
+  int h = timeClient.getHours();
+  int m = timeClient.getMinutes();
+  int s = timeClient.getSeconds();
+
+  if (h == alarmHour && m == alarmMinute && s < 2) {
+    alarmRinging = true;
+    Serial.println("ALARM!");
+  }
+}
+
+void stopAlarm() {
+  alarmRinging = false;
+  snoozeActive = false;
+  melodyActive = false;
+  melodyIndex  = 0;
+  noTone(BUZZER_PIN);
+  digitalWrite(BUZZER_PIN, LOW);
+  Serial.println("Alarm stopped");
+}
+
+void snoozeAlarm() {
+  alarmRinging = false;
+  melodyActive = false;
+  melodyIndex  = 0;
+  noTone(BUZZER_PIN);
+  digitalWrite(BUZZER_PIN, LOW);
+  snoozeActive = true;
+  snoozeUntil  = millis() + (unsigned long)snoozeMinutes * 60000UL;
+  Serial.printf("Snoozed for %d minutes\n", snoozeMinutes);
+}
+
+// ---------- MELODY PLAYER ----------
+void updateMelody() {
+  if (!alarmRinging) {
+    if (melodyActive) {
+      noTone(BUZZER_PIN);
+      melodyActive = false;
+      melodyIndex  = 0;
+    }
+    return;
+  }
+
+  unsigned long now = millis();
+  const Note* melody = MELODIES[selectedMelody];
+  int len = MELODY_LENGTHS[selectedMelody];
+
+  if (!melodyActive) {
+    melodyActive    = true;
+    melodyIndex     = 0;
+    melodyNoteStart = now;
+    Note n = melody[melodyIndex];
+    if (n.freq > 0) tone(BUZZER_PIN, n.freq, n.dur);
+    return;
+  }
+
+  Note current = melody[melodyIndex];
+  if (now - melodyNoteStart >= current.dur) {
+    noTone(BUZZER_PIN);
+    melodyIndex = (melodyIndex + 1) % len;
+    melodyNoteStart = now;
+    Note next = melody[melodyIndex];
+    if (next.freq > 0) tone(BUZZER_PIN, next.freq, next.dur);
+  }
+}
+
+// ---------- MINUTE BEEP ----------
+void handleMinuteBeep() {
+  if (!minuteBeepEnabled || alarmRinging || snoozeActive) return;
+  int s = timeClient.getSeconds();
+  int m = timeClient.getMinutes();
+  if (s == 0 && m != lastMinuteTick) {
+    lastMinuteTick = m;
+    tone(BUZZER_PIN, 800, 60);
+  }
+}
+
+// ---------- BUTTON ----------
+void handleButton() {
+  bool state = digitalRead(BUTTON_PIN);
+  if (state == LOW && lastButtonState == HIGH && (millis() - lastButtonPress > 300)) {
+    lastButtonPress = millis();
+
+    if (alarmRinging || snoozeActive) {
+      stopAlarm();
+    } else {
+      showDate = !showDate;
+      lastViewToggle = millis();
+      updateDisplay();
+    }
+  }
+  lastButtonState = state;
+}
+
+// ---------- WEB HANDLERS ----------
+void handleRoot() {
+  String html = R"HTML(
+<!DOCTYPE html><html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WiFi Alarm Clock</title>
+<style>
+  body { font-family: system-ui, sans-serif; background:#111; color:#eee;
+         display:flex; justify-content:center; padding:20px; margin:0; }
+  .card { background:#1e1e1e; padding:24px; border-radius:16px;
+          box-shadow:0 4px 20px rgba(0,0,0,.5); width:360px; }
+  h1 { font-size:1.3rem; margin-top:0; text-align:center; }
+  label { display:block; margin:12px 0 4px; font-size:.9rem; color:#aaa; }
+  input[type=time], input[type=number], select {
+    width:100%; padding:10px; font-size:1.1rem; border-radius:8px;
+    border:1px solid #333; background:#0d0d0d; color:#eee; box-sizing:border-box; }
+  button { width:100%; padding:12px; margin-top:14px; font-size:1rem;
+           border-radius:8px; border:none; cursor:pointer; font-weight:600; }
+  .primary { background:#3b82f6; color:#fff; }
+  .danger  { background:#ef4444; color:#fff; }
+  .warn    { background:#f59e0b; color:#000; }
+  .ghost   { background:#333; color:#eee; }
+  .row { display:flex; gap:8px; }
+  .row button { flex:1; margin-top:0; }
+  .status { text-align:center; margin-top:16px; font-size:.9rem; color:#888; }
+  .toggle { display:flex; align-items:center; gap:8px; margin-top:12px;
+            font-size:.9rem; color:#aaa; }
+</style></head><body>
+<div class="card">
+  <h1>⏰ WiFi Alarm</h1>
+  <form action="/set" method="GET">
+    <label>Alarm Time</label>
+    <input type="time" name="time" id="time" required>
+    <label>Snooze (minutes)</label>
+    <input type="number" name="snooze" value="5" min="1" max="30">
+    <label>Alarm Sound</label>
+    <select name="melody" id="melody">
+      <option value="0">Morning Chime</option>
+      <option value="1">Soft Bell</option>
+      <option value="2">Upbeat Rise</option>
+    </select>
+    <div class="toggle">
+      <input type="checkbox" name="minutebeep" id="minutebeep" value="1">
+      <label for="minutebeep" style="margin:0">Soft tick every minute</label>
+    </div>
+    <div class="toggle">
+      <input type="checkbox" name="autotoggle" id="autotoggle" value="1">
+      <label for="autotoggle" style="margin:0">Auto-cycle time ↔ date</label>
+    </div>
+    <button class="primary" type="submit">Set Alarm</button>
+  </form>
+  <button class="ghost" onclick="fetch('/test')">🔊 Preview Sound</button>
+  <button class="ghost" onclick="fetch('/view')">📅 Toggle Time / Date</button>
+  <div class="row" style="margin-top:14px">
+    <button class="warn"   onclick="fetch('/snooze')">Snooze</button>
+    <button class="danger" onclick="fetch('/stop')">Stop</button>
+  </div>
+  <div class="status" id="status">Loading...</div>
+</div>
+<script>
+  async function refresh(){
+    try{
+      const r = await fetch('/status');
+      const j = await r.json();
+      document.getElementById('status').textContent =
+        `Alarm: ${j.enabled ? j.time : 'OFF'} | ${j.ringing ? '🔔 RINGING' : (j.snoozed ? '😴 Snoozed' : 'Idle')} | ${j.showdate ? '📅 Date' : '🕒 Time'}`;
+      if(j.enabled) document.getElementById('time').value = j.time;
+      document.getElementById('melody').value = j.melody;
+      document.getElementById('minutebeep').checked = j.minutebeep;
+      document.getElementById('autotoggle').checked = j.autotoggle;
+    }catch(e){}
+  }
+  refresh(); setInterval(refresh, 3000);
+</script>
+</body></html>
+)HTML";
+  server.send(200, "text/html", html);
+}
+
+void handleSetAlarm() {
+  if (server.hasArg("time")) {
+    String t = server.arg("time");
+    int colon = t.indexOf(':');
+    if (colon > 0) {
+      alarmHour   = t.substring(0, colon).toInt();
+      alarmMinute = t.substring(colon + 1).toInt();
+      alarmEnabled = true;
+      stopAlarm();
+    }
+  }
+  if (server.hasArg("snooze")) {
+    int s = server.arg("snooze").toInt();
+    if (s >= 1 && s <= 30) snoozeMinutes = s;
+  }
+  if (server.hasArg("melody")) {
+    int m = server.arg("melody").toInt();
+    if (m >= 0 && m < MELODY_COUNT) selectedMelody = m;
+  }
+  minuteBeepEnabled = server.hasArg("minutebeep");
+  autoToggleView    = server.hasArg("autotoggle");
+
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleStopAlarm() {
+  stopAlarm();
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleSnooze() {
+  if (alarmRinging) snoozeAlarm();
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleSetMelody() {
+  if (server.hasArg("id")) {
+    int m = server.arg("id").toInt();
+    if (m >= 0 && m < MELODY_COUNT) selectedMelody = m;
+  }
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleToggleView() {
+  showDate = !showDate;
+  lastViewToggle = millis();
+  updateDisplay();
+  server.send(200, "application/json",
+    showDate ? "{\"view\":\"date\"}" : "{\"view\":\"time\"}");
+}
+
+void handleTestMelody() {
+  const Note* melody = MELODIES[selectedMelody];
+  int len = MELODY_LENGTHS[selectedMelody];
+  for (int i = 0; i < len; i++) {
+    if (melody[i].freq > 0) tone(BUZZER_PIN, melody[i].freq, melody[i].dur);
+    delay(melody[i].dur);
+    noTone(BUZZER_PIN);
+    delay(20);
+  }
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleStatus() {
+  char buf[260];
+  snprintf(buf, sizeof(buf),
+    "{\"enabled\":%s,\"time\":\"%02d:%02d\",\"ringing\":%s,\"snoozed\":%s,"
+    "\"melody\":%d,\"minutebeep\":%s,\"autotoggle\":%s,\"showdate\":%s}",
+    alarmEnabled ? "true" : "false",
+    alarmHour, alarmMinute,
+    alarmRinging ? "true" : "false",
+    snoozeActive ? "true" : "false",
+    selectedMelody,
+    minuteBeepEnabled ? "true" : "false",
+    autoToggleView    ? "true" : "false",
+    showDate          ? "true" : "false");
+  server.send(200, "application/json", buf);
+}
