@@ -68,3 +68,15 @@ NTPClient by Fabrice Weinberg
 ESP8266WebServer (built into ESP8266 board package)
 
 ESP8266WiFi (built in)
+
+Ideas to try:
+
+Gentler sunrise chime — slow tempo, softer notes: {392,400},{440,400},{494,400},{523,600},{0,1000}
+
+Nokia-style ringtone — {659,125},{587,125},{370,250},{415,250},{554,125},{494,125},{294,250},{330,250},{494,125}
+
+Beethoven's 5th (dramatic) — {622,200},{622,200},{622,200},{494,600},{0,300}
+
+Two-tone "school bell" — {880,500},{660,500},{0,200}
+
+Just remember: the last entry should be a rest so the loop has a natural pause before it repeats.
